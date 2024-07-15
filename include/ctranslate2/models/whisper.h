@@ -53,6 +53,9 @@ namespace ctranslate2 {
       // List of token IDs to suppress.
       // -1 will suppress a default set of symbols as defined in the model config.json file.
       std::vector<int> suppress_tokens = {-1};
+
+      std::vector<std::string> boost_words;
+      float boost_amount = 1.0;
     };
 
     struct WhisperGenerationResult {
