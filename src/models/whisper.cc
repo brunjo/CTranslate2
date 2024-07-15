@@ -271,14 +271,12 @@ namespace ctranslate2 {
         const DataType dtype = _decoder->output_type();
         const StorageView inputs = layers::make_sequence_inputs(prompt_tokens, device);
 
-        // Initialize the decoder state with the prompt.
         if (!options.return_no_speech_prob || sot_is_start_token)
           _decoder->forward_prompt(inputs, state);
         else {
           StorageView outputs(dtype, device);
           _decoder->forward_prompt(inputs, state, &outputs);
-
-          // Get the probability of the no speech token at the start of transcript step.
+    
           StorageView sot_index_batch({inputs.dim(0)}, int32_t(sot_index), device);
           StorageView logits(dtype, device);
           _decoder->compute_logits_for_steps(outputs, sot_index_batch, logits);
@@ -320,7 +318,6 @@ namespace ctranslate2 {
 
       std::shared_ptr<GetNoSpeechProbs> no_speech_probs_processor;
       if (options.return_no_speech_prob && sot_is_start_token) {
-        // If SOT is the start token, we need to get the no speech prob in the first decoding loop.
         no_speech_probs_processor = std::make_shared<GetNoSpeechProbs>(_no_speech_id);
         decoding_options.logits_processors.emplace_back(no_speech_probs_processor);
       }
@@ -335,6 +332,12 @@ namespace ctranslate2 {
                                                 timestamp_begin_id,
                                                 timestamp_end_id,
                                                 max_initial_timestamp_id));
+      }
+
+      // Add the custom logits processor
+      if (!options.boost_words.empty()) {
+        decoding_options.logits_processors.emplace_back(
+          std::make_shared<BoostWordsLogitsProcessor>(options.boost_words, vocabulary, options.boost_amount));
       }
 
       std::vector<DecodingResult> results = decode(*_decoder,
@@ -358,10 +361,8 @@ namespace ctranslate2 {
         final_result.scores = std::move(result.scores);
         if (options.return_no_speech_prob)
           final_result.no_speech_prob = no_speech_probs[i];
-
         final_results.emplace_back(std::move(final_result));
       }
-
       return final_results;
     }
 
@@ -842,6 +843,82 @@ namespace ctranslate2 {
         return timestamp_log_prob > max_text_token_log_prob;
       }
 
+    };
+
+    class BoostWordsLogitsProcessor : public LogitsProcessor {
+    private:
+      std::vector<std::vector<size_t>> _boost_token_sequences;
+      std::unordered_set<size_t> _skip_tokens;
+      float _boost_amount;
+    
+    public:
+      BoostWordsLogitsProcessor(const std::vector<std::string>& boost_words,
+                                const Vocabulary& vocabulary,
+                                float boost_amount)
+        : _boost_amount(boost_amount) {
+        for (const auto& word : boost_words) {
+          auto token_sequence = vocabulary.to_ids({word});
+          _boost_token_sequences.push_back(token_sequence);
+    
+          // Check for the lowercase version if the word has uppercase letters.
+          if (std::any_of(word.begin(), word.end(), ::isupper)) {
+            auto lower_token_sequence = vocabulary.to_ids({to_lower(word)});
+            _boost_token_sequences.push_back(lower_token_sequence);
+          }
+        }
+    
+        // Skip tokens (e.g., comma)
+        _skip_tokens.insert(vocabulary.to_id(","));
+      }
+    
+      void apply(dim_t step,
+                 StorageView& logits,
+                 DisableTokens&,
+                 const StorageView& input_ids,
+                 const std::vector<dim_t>& batch_offset,
+                 const std::vector<std::vector<size_t>>*) override {
+        const auto& batch_size = logits.dim(0);
+    
+        for (dim_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+          const auto highest_score_idx = primitives<Device::CPU>::argmax(logits.index<float>({batch_idx, 0}), logits.dim(-1));
+          
+          if (_skip_tokens.find(highest_score_idx) != _skip_tokens.end()) {
+            continue; // Skip boosting for these tokens.
+          }
+    
+          const dim_t current_position = input_ids.dim(1); // Current position in the sequence.
+          std::unordered_map<size_t, float> boosted_tokens;
+    
+          for (const auto& token_sequence : _boost_token_sequences) {
+            const dim_t seq_len = token_sequence.size();
+            const dim_t check_last_x_tokens = std::min(seq_len, current_position);
+    
+            if (check_last_x_tokens > 1) {
+              for (dim_t i = 1; i < check_last_x_tokens; ++i) {
+                bool match = true;
+                for (dim_t j = 0; j < check_last_x_tokens - i; ++j) {
+                  if (input_ids.at<int32_t>({batch_idx, current_position - check_last_x_tokens + i + j}) != token_sequence[j]) {
+                    match = false;
+                    break;
+                  }
+                }
+                if (match) {
+                  boosted_tokens[token_sequence[seq_len - i]] = _boost_amount;
+                  break;
+                }
+              }
+            }
+    
+            if (boosted_tokens.find(token_sequence[0]) == boosted_tokens.end()) {
+              boosted_tokens[token_sequence[0]] = _boost_amount / 2;
+            }
+          }
+    
+          for (const auto& [token, boost] : boosted_tokens) {
+            logits.at<float>({batch_idx, token}) += boost;
+          }
+        }
+      }
     };
 
   }
